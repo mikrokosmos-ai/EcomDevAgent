@@ -1,0 +1,30 @@
+[project]
+name = "ecomdevagent"
+version = "0.2.0"
+description = "EcomDevAgent — 终端 AI 研发自动化 Agent（电商 AI 三件套之研发自动化）：ReAct/Plan 双模 + Loop/Harness 工程 + Agent 自进化"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=2.1.0",
+    "anthropic>=0.42.0",
+    "openai>=1.60.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "mcp>=1.12.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+ecomdevagent = "ecomdevagent.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ecomdevagent"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]

@@ -1,0 +1,91 @@
+# ───────────────────────────────────────────────────────────
+# EcomDevAgent — .gitignore
+# Python (uv) + Textual TUI 编码 Agent 项目
+# ───────────────────────────────────────────────────────────
+
+# ── Python 字节码 / 编译产物 ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ── 打包 / 分发 ──
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+*.whl
+
+# ── 虚拟环境 (uv venv) ──
+.venv/
+venv/
+env/
+.venv.bak/
+
+# ── 测试 / 覆盖率 ──
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+.nox/
+
+# ── 类型检查 / lint 缓存 ──
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pylintrc.bak
+
+# ── 环境变量 / 密钥 (含 API Key) ──
+.env
+.env.*
+*.local
+secrets.yaml
+credentials.json
+
+# ── 运行期数据目录 (session/memory/audit/evolution/journals) ──
+# README 约定：项目级 .ecomdevagent/config.yaml 也在此目录，含密钥不入库
+.ecomdevagent/
+.ecomdevagent.bak/
+
+# ── 日志 ──
+*.log
+logs/
+*.journal
+
+# ── 编辑器 / IDE ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── 操作系统 ──
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ── 临时 / 调试产物 ──
+*.tmp
+*.bak
+*~
+_test*
+test_*.db
+*.db.bak
+
+# ── 暂不入库（本地隔离）──
+tests/
+README.md

@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from .validator import (
+    ConfigError,
+    DEFAULT_CONTEXT_WINDOW,
+    VALID_PERMISSION_MODES,
+    VALID_PROTOCOLS,
+    VALID_TEAMMATE_MODES,
+    lookup_model_context_window,
+    validate_config_structure,
+)
+
+
+_ENV_KEY_MAP = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai-compat": "OPENAI_API_KEY",
+}
+
+_ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+@dataclass
+class ProviderConfig:
+    name: str
+    protocol: str
+    base_url: str
+    model: str
+    api_key: str = ""
+    thinking: bool = False
+    # 0 表示"未设置" — get_context_window() 通过四层 fallback 解析真实窗口大小。
+    # 正数表示配置文件里显式指定的覆盖值。
+    context_window: int = 0
+    max_output_tokens: int = 0
+    # 运行时 cache，存放从 provider 的 /v1/models 端点自动拉取的 context window
+    # （get_context_window 的第 2 层）。通过 set_fetched_context_window() 写入一次；
+    # 0 表示"尚未拉取"。不会持久化。
+    _fetched_context_window: int = field(default=0, repr=False)
+
+    def resolve_api_key(self) -> str:
+        if self.api_key:
+            return self.api_key
+        # provider 专属覆盖：ECOMDEVAGENT_<NAME>_API_KEY（按 provider 名匹配，
+        # 优先于按 protocol 匹配的通用 key）。多 provider 场景下可按名字分别注入 key。
+        specific = os.environ.get(f"ECOMDEVAGENT_{self.name.upper()}_API_KEY", "")
+        if specific:
+            return specific
+        env_var = _ENV_KEY_MAP.get(self.protocol, "")
+        return os.environ.get(env_var, "")
+
+    def set_fetched_context_window(self, window: int) -> None:
+        """记录从 provider 自动拉取到的 context window（第 2 层）。
+
+        非正数会被忽略，这样一次失败的拉取就不会污染 cache。在解析
+        context window 时，每个 provider 只会调用一次。
+        """
+        if window > 0:
+            self._fetched_context_window = window
+
+    def get_context_window(self) -> int:
+        """通过四层 fallback 解析模型的 context window，按优先级从高到低：
+
+          1. 配置文件提供的 context_window（> 0）——显式覆盖，永远优先。
+          2. 从 provider 的 /v1/models 端点自动拉取并通过 set_fetched_context_window
+             缓存的值（只有 anthropic 协议的 provider 才会设置它；拉取失败或缺失时
+             保持为 0 并跳过）。
+          3. 内置的「模型名 -> window」映射表（按子串匹配）。
+          4. 保守的默认值（claude -> 200000，其他 -> 128000）。
+        """
+        if self.context_window > 0:
+            return self.context_window
+        if self._fetched_context_window > 0:
+            return self._fetched_context_window
+        window = lookup_model_context_window(self.model)
+        if window > 0:
+            return window
+        if "claude" in self.model.lower():
+            return DEFAULT_CONTEXT_WINDOW
+        return 128_000
+
+    def get_max_output_tokens(self) -> int:
+        if self.max_output_tokens > 0:
+            return self.max_output_tokens
+        if self.thinking:
+            return 64000
+        return 8192
+
+
+def resolve_env_vars(value: str) -> str:
+    return _ENV_VAR_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
+
+
+def _load_dotenv_file(path: Path) -> dict[str, str]:
+    """解析单个 .env 文件为 ``key -> value`` 字典。
+
+    支持：``#`` / ``//`` 注释行、空行、行首 ``export `` 前缀、单/双引号包裹的值。
+    不做变量展开（展开由 :func:`resolve_env_vars` 在配置值层面处理）。
+    文件不存在时返回空字典，不会抛异常。
+    """
+    result: dict[str, str] = {}
+    if not path.is_file():
+        return result
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        # 去掉包裹的引号
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            result[key] = value
+    return result
+
+
+def load_dotenv_files(root: Path | None = None) -> None:
+    """从项目根目录的 ``.env`` / ``.env.local`` 把密钥载入 ``os.environ``。
+
+    加载顺序（在 .env 链内后者覆盖前者）：
+
+      1. ``<root>/.env``
+      2. ``<root>/.env.local``
+
+    **真实 shell 环境变量始终优先**：已被真实环境设置的 key 不会被 .env 覆盖，
+    这样用户总能用真实环境变量覆盖文件里的值。幂等、可在启动时安全调用一次。
+
+    注意此函数须在 :func:`load_config` 之前调用，以便
+    :meth:`ProviderConfig.resolve_api_key` 的 ``os.environ`` 回落逻辑能接住 key。
+    """
+    root = root or Path.cwd()
+    real_env = set(os.environ)  # 启动前已存在的真实环境；dotenv 永不覆盖它
+    for name in (".env", ".env.local"):
+        for key, value in _load_dotenv_file(root / name).items():
+            if key in real_env:
+                continue
+            os.environ[key] = value
+
+
+def build_child_env(declared_env: dict[str, str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    path = os.environ.get("PATH", "")
+    if path:
+        env["PATH"] = path
+    for key, value in (declared_env or {}).items():
+        env[key] = resolve_env_vars(value)
+    return env
+
+
+@dataclass
+class MCPServerConfig:
+    name: str
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+    @property
+    def is_stdio(self) -> bool:
+        return self.command is not None
+
+
+@dataclass
+class WorktreeConfig:
+    symlink_directories: list[str] = field(default_factory=lambda: ["node_modules", ".venv", "vendor"])
+    stale_cleanup_interval: int = 3600
+    stale_cutoff_hours: int = 24
+
+
+@dataclass
+class CompactConfig:
+    utilization_threshold: float = 0.85
+    min_keep_messages: int = 3
+
+
+@dataclass
+class CriticConfig:
+    enabled: bool = False
+
+
+@dataclass
+class RateLimitConfig:
+    enabled: bool = True
+    default_max_per_minute: int = 30
+    per_tool: dict[str, int] = field(default_factory=lambda: {"Bash": 10, "WriteFile": 20})
+
+
+@dataclass
+class EvolutionConfig:
+    """自进化子系统配置。"""
+
+    enabled: bool = False
+    min_traces_trigger: int = 30
+    max_traces_per_evolution: int = 50
+    min_traces_per_evolution: int = 30
+    min_failure_recurrence: int = 3
+    token_increase_threshold: float = 0.15
+    deprecation_task_threshold: int = 60
+    backup_dir: str = "harness/backup"
+    traces_dir: str = "harness/traces"
+    skills_dir: str = "harness/skills"
+    skill_meta_file: str = "harness/skills/skill_meta.json"
+    # 成功经验路径配置
+    success_enabled: bool = False
+    success_iteration_threshold: int = 8  # 迭代数 ≥ 此值视为复杂
+    success_tool_call_threshold: int = 10  # 工具调用数 ≥ 此值视为复杂
+    success_promotion_recurrence: int = 2  # 同类成功复发达此值晋升正式
+    success_match_enabled: bool = True  # 任务开始时是否做 Skill 注入匹配
+    success_match_timeout: float = 8.0  # 匹配侧路调用超时（秒）
+    success_baseline_samples: int = 5  # 降本评估的历史基线样本数
+    success_iteration_reduction_threshold: float = 0.20  # 迭代降幅阈值
+    success_hit_failure_threshold: int = 3  # 命中失败累计达此值降级
+
+
+@dataclass
+class AppConfig:
+    providers: list[ProviderConfig]
+    permission_mode: str = "default"
+    mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    raw_hooks: list[dict] = field(default_factory=list)
+    enable_fork: bool = False
+    enable_verification_agent: bool = False
+    worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
+    teammate_mode: str = ""
+    enable_coordinator_mode: bool = False
+    # Harness Engineering 新增
+    compact: CompactConfig = field(default_factory=CompactConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
+    rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
+    allow_self_modification: bool = False
+    # Evolution Engineering 新增
+    allow_self_evolution: bool = False
+    evolution: EvolutionConfig = field(default_factory=EvolutionConfig)
+
+
+def _load_single_file(path: Path) -> AppConfig:
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Failed to parse config {path}: {e}") from e
+
+    validated = validate_config_structure(raw)
+
+    providers = [
+        ProviderConfig(
+            name=p["name"],
+            protocol=p["protocol"],
+            base_url=p["base_url"],
+            model=p["model"],
+            api_key=p["api_key"],
+            thinking=p["thinking"],
+            context_window=p["context_window"],
+            max_output_tokens=p["max_output_tokens"],
+        )
+        for p in validated["providers"]
+    ]
+
+    mcp_servers = [
+        MCPServerConfig(
+            name=s["name"],
+            command=s["command"],
+            args=s["args"],
+            url=s["url"],
+            headers=s["headers"],
+            env=s["env"],
+        )
+        for s in validated["mcp_servers"]
+    ]
+
+    wt = validated["worktree"]
+    worktree_cfg = WorktreeConfig(
+        symlink_directories=wt["symlink_directories"],
+        stale_cleanup_interval=wt["stale_cleanup_interval"],
+        stale_cutoff_hours=wt["stale_cutoff_hours"],
+    )
+
+    return AppConfig(
+        providers=providers,
+        permission_mode=validated["permission_mode"],
+        mcp_servers=mcp_servers,
+        raw_hooks=validated["hooks"],
+        enable_fork=validated["enable_fork"],
+        enable_verification_agent=validated["enable_verification_agent"],
+        worktree=worktree_cfg,
+        teammate_mode=validated["teammate_mode"],
+        enable_coordinator_mode=validated["enable_coordinator_mode"],
+        # Harness Engineering 新增
+        compact=CompactConfig(
+            utilization_threshold=validated.get("compact", {}).get("utilization_threshold", 0.85),
+            min_keep_messages=validated.get("compact", {}).get("min_keep_messages", 3),
+        ),
+        critic=CriticConfig(
+            enabled=validated.get("critic", {}).get("enabled", False),
+        ),
+        rate_limit=RateLimitConfig(
+            enabled=validated.get("rate_limit", {}).get("enabled", True),
+            default_max_per_minute=validated.get("rate_limit", {}).get("default_max_per_minute", 30),
+            per_tool=validated.get("rate_limit", {}).get("per_tool", {"Bash": 10, "WriteFile": 20}),
+        ),
+        allow_self_modification=validated.get("allow_self_modification", False),
+        allow_self_evolution=validated.get("allow_self_evolution", False),
+        evolution=EvolutionConfig(
+            enabled=validated.get("evolution", {}).get("enabled", False),
+            min_traces_trigger=validated.get("evolution", {}).get("min_traces_trigger", 30),
+            max_traces_per_evolution=validated.get("evolution", {}).get("max_traces_per_evolution", 50),
+            min_traces_per_evolution=validated.get("evolution", {}).get("min_traces_per_evolution", 30),
+            min_failure_recurrence=validated.get("evolution", {}).get("min_failure_recurrence", 3),
+            token_increase_threshold=validated.get("evolution", {}).get("token_increase_threshold", 0.15),
+            deprecation_task_threshold=validated.get("evolution", {}).get("deprecation_task_threshold", 60),
+            success_enabled=validated.get("evolution", {}).get("success_enabled", False),
+            success_iteration_threshold=validated.get("evolution", {}).get("success_iteration_threshold", 8),
+            success_tool_call_threshold=validated.get("evolution", {}).get("success_tool_call_threshold", 10),
+            success_promotion_recurrence=validated.get("evolution", {}).get("success_promotion_recurrence", 2),
+            success_match_enabled=validated.get("evolution", {}).get("success_match_enabled", True),
+            success_match_timeout=validated.get("evolution", {}).get("success_match_timeout", 8.0),
+            success_baseline_samples=validated.get("evolution", {}).get("success_baseline_samples", 5),
+            success_iteration_reduction_threshold=validated.get("evolution", {}).get("success_iteration_reduction_threshold", 0.20),
+            success_hit_failure_threshold=validated.get("evolution", {}).get("success_hit_failure_threshold", 3),
+        ),
+    )
+
+
+def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
+    if override.providers:
+        base.providers = override.providers
+    if override.permission_mode != "default":
+        base.permission_mode = override.permission_mode
+
+    if override.mcp_servers:
+        by_name = {s.name: i for i, s in enumerate(base.mcp_servers)}
+        for s in override.mcp_servers:
+            if s.name in by_name:
+                base.mcp_servers[by_name[s.name]] = s
+            else:
+                base.mcp_servers.append(s)
+                by_name[s.name] = len(base.mcp_servers) - 1
+
+    base.raw_hooks.extend(override.raw_hooks)
+    if override.enable_fork:
+        base.enable_fork = True
+    if override.enable_verification_agent:
+        base.enable_verification_agent = True
+    if override.teammate_mode:
+        base.teammate_mode = override.teammate_mode
+    if override.enable_coordinator_mode:
+        base.enable_coordinator_mode = True
+    return base
+
+
+def load_config(path: Path | None = None) -> AppConfig:
+    if path is not None:
+        if not path.exists():
+            raise ConfigError(f"Config file not found: {path}")
+        return _load_single_file(path)
+
+    cwd = Path.cwd()
+    home = Path.home()
+    candidates = [
+        home / ".ecomdevagent" / "config.yaml",
+        cwd / ".ecomdevagent" / "config.yaml",
+        cwd / ".ecomdevagent" / "config.local.yaml",
+    ]
+
+    merged: AppConfig | None = None
+    for p in candidates:
+        if not p.exists():
+            continue
+        layer = _load_single_file(p)
+        if merged is None:
+            merged = layer
+        else:
+            merged = _merge_config(merged, layer)
+
+    if merged is None:
+        raise ConfigError(
+            "No config file found. Expected .ecomdevagent/config.yaml "
+            "in project or ~/.ecomdevagent/config.yaml"
+        )
+    return merged
