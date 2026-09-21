@@ -88,4 +88,3 @@ test_*.db
 
 # ── 暂不入库（本地隔离）──
 tests/
-README.md
